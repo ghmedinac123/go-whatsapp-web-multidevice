@@ -183,6 +183,14 @@
         <webhook-config :connected="connected_devices"></webhook-config>
     </div>
 
+    <div class="ui horizontal divider">
+        Campaigns
+    </div>
+
+    <div class="ui three column doubling grid cards">
+        <campaign-manager :connected="connected_devices"></campaign-manager>
+    </div>
+
 </div>
 <script>
     window.TYPEGROUP = "@g.us";
@@ -269,6 +277,7 @@
     import DeviceManager from "{{ .AppBasePath }}/components/DeviceManager.js";
     import ChatwootConfig from "{{ .AppBasePath }}/components/ChatwootConfig.js";
     import WebhookConfig from "{{ .AppBasePath }}/components/WebhookConfig.js";
+    import CampaignManager from "{{ .AppBasePath }}/components/CampaignManager.js";
 
     const showErrorInfo = (message) => {
         $('body').toast({
@@ -298,7 +307,7 @@
             NewsletterList,
             AccountAvatar, AccountUserInfo, AccountPrivacy, AccountChangeAvatar, AccountContact, AccountChangePushName, AccountUserCheck, AccountBusinessProfile,
             ChatPinManager, ChatDisappearingManager, ChatList, ChatMessages,
-            DeviceManager, ChatwootConfig, WebhookConfig
+            DeviceManager, ChatwootConfig, WebhookConfig, CampaignManager
         },
         delimiters: ['[[', ']]'],
         data() {
