@@ -55,6 +55,16 @@ func NewWebhookConfigHandler(
 	return &WebhookConfigHandler{Repo: repo, Registry: registry, DeviceManager: dm}
 }
 
+// ListEvents returns the catalog of webhook events a device can subscribe to,
+// so the UI can render selectable checkboxes instead of free-text entry.
+func (h *WebhookConfigHandler) ListEvents(c *fiber.Ctx) error {
+	return c.JSON(utils.ResponseData{
+		Code:    "SUCCESS",
+		Message: "Supported webhook events",
+		Results: domainWebhook.SupportedEvents(),
+	})
+}
+
 // List returns every stored webhook config.
 func (h *WebhookConfigHandler) List(c *fiber.Ctx) error {
 	configs, err := h.Repo.GetAll()

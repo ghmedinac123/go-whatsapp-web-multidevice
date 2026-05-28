@@ -4,6 +4,7 @@ export default {
     data() {
         return {
             configs: [],
+            availableEvents: [],
             loading: false,
             saving: false,
             editing: false,
@@ -16,6 +17,15 @@ export default {
             return this.connected
                 .map(d => d.jid || d.device || d.id)
                 .filter(Boolean);
+        },
+        // Events grouped by category for the checkbox UI, preserving the
+        // backend's ordering within each group.
+        groupedEvents() {
+            const groups = {};
+            for (const ev of this.availableEvents) {
+                (groups[ev.group] = groups[ev.group] || []).push(ev);
+            }
+            return groups;
         }
     },
     methods: {
@@ -25,19 +35,24 @@ export default {
                 device_id: '',
                 webhook_url: '',
                 secret: '',
-                events_text: '', // comma-separated; empty = all events
+                events: [], // selected event names; empty = all events
                 headers_text: '', // JSON object; empty = none
                 enabled: true,
             };
         },
         async openModal() {
             try {
-                await this.fetchConfigs();
+                await Promise.all([this.fetchConfigs(), this.fetchEvents()]);
                 this.resetForm();
                 $('#modalWebhookConfig').modal({observeChanges: true}).modal('show');
             } catch (err) {
                 showErrorInfo(this.errMsg(err));
             }
+        },
+        async fetchEvents() {
+            if (this.availableEvents.length) return; // catalog is static; fetch once
+            const response = await window.http.get(`/webhook/events`);
+            this.availableEvents = response.data.results || [];
         },
         resetForm() {
             this.editing = false;
@@ -66,16 +81,13 @@ export default {
                 device_id: cfg.device_id,
                 webhook_url: cfg.webhook_url,
                 secret: cfg.secret || '',
-                events_text: (cfg.events || []).join(', '),
+                events: (cfg.events || []).slice(),
                 headers_text: cfg.headers ? JSON.stringify(cfg.headers, null, 2) : '',
                 enabled: !!cfg.enabled,
             };
         },
         buildPayload() {
-            const events = this.form.events_text
-                .split(',')
-                .map(s => s.trim())
-                .filter(Boolean);
+            const events = this.form.events.slice();
 
             let headers = {};
             const raw = (this.form.headers_text || '').trim();
@@ -238,14 +250,26 @@ export default {
                         <input type="text" v-model="form.webhook_url" placeholder="https://backend.example.com/webhook">
                     </div>
                 </div>
-                <div class="two fields">
-                    <div class="field">
-                        <label>HMAC Secret</label>
-                        <input type="text" v-model="form.secret" placeholder="(optional; falls back to WHATSAPP_WEBHOOK_SECRET)">
+                <div class="field">
+                    <label>HMAC Secret</label>
+                    <input type="text" v-model="form.secret" placeholder="(optional; falls back to WHATSAPP_WEBHOOK_SECRET)">
+                </div>
+                <div class="field">
+                    <label>Events</label>
+                    <div class="ui small message" style="margin-top:0">
+                        Select which events this webhook receives. Leave all unchecked to receive <b>every</b> event.
                     </div>
-                    <div class="field">
-                        <label>Events (comma-separated)</label>
-                        <input type="text" v-model="form.events_text" placeholder="message,message.ack (empty = all)">
+                    <div v-if="availableEvents.length === 0" class="ui tiny warning message">
+                        Could not load the event list.
+                    </div>
+                    <div v-for="(evs, group) in groupedEvents" :key="group" style="margin-bottom:10px">
+                        <div style="font-weight:bold; margin:6px 0 4px">{{ group }}</div>
+                        <div style="display:flex; flex-wrap:wrap; gap:8px 16px">
+                            <div class="ui checkbox" v-for="ev in evs" :key="ev.event" style="margin:0">
+                                <input type="checkbox" :id="'whEv-'+ev.event" :value="ev.event" v-model="form.events">
+                                <label :for="'whEv-'+ev.event" :title="ev.description">{{ ev.event }}</label>
+                            </div>
+                        </div>
                     </div>
                 </div>
                 <div class="field">

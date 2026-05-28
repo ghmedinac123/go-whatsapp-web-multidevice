@@ -152,6 +152,7 @@ func restServer(_ *cobra.Command, _ []string) {
 	// registry so changes take effect without a restart.
 	if webhookConfigRepo != nil {
 		webhookConfigHandler := rest.NewWebhookConfigHandler(webhookConfigRepo, webhookRegistry, dm)
+		apiGroup.Get("/webhook/events", webhookConfigHandler.ListEvents)
 		apiGroup.Get("/webhook/configs", webhookConfigHandler.List)
 		apiGroup.Get("/webhook/configs/:device_id", webhookConfigHandler.GetByDevice)
 		apiGroup.Post("/webhook/configs", webhookConfigHandler.Create)
