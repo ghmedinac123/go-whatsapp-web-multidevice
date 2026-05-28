@@ -19,3 +19,4 @@ src/whatsapp
 src/gowa
 docs2
 statics/
+src/.env.production
