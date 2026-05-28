@@ -175,6 +175,14 @@
     </div>
     {{ end }}
 
+    <div class="ui horizontal divider">
+        Webhooks
+    </div>
+
+    <div class="ui three column doubling grid cards">
+        <webhook-config :connected="connected_devices"></webhook-config>
+    </div>
+
 </div>
 <script>
     window.TYPEGROUP = "@g.us";
@@ -260,6 +268,7 @@
     import ChatMessages from "{{ .AppBasePath }}/components/ChatMessages.js";
     import DeviceManager from "{{ .AppBasePath }}/components/DeviceManager.js";
     import ChatwootConfig from "{{ .AppBasePath }}/components/ChatwootConfig.js";
+    import WebhookConfig from "{{ .AppBasePath }}/components/WebhookConfig.js";
 
     const showErrorInfo = (message) => {
         $('body').toast({
@@ -289,7 +298,7 @@
             NewsletterList,
             AccountAvatar, AccountUserInfo, AccountPrivacy, AccountChangeAvatar, AccountContact, AccountChangePushName, AccountUserCheck, AccountBusinessProfile,
             ChatPinManager, ChatDisappearingManager, ChatList, ChatMessages,
-            DeviceManager, ChatwootConfig
+            DeviceManager, ChatwootConfig, WebhookConfig
         },
         delimiters: ['[[', ']]'],
         data() {
