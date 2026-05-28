@@ -13,6 +13,7 @@ import (
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	domainApp "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/app"
+	domainCampaign "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/campaign"
 	domainChat "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chat"
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainChatwoot "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatwoot"
@@ -23,6 +24,7 @@ import (
 	domainSend "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/send"
 	domainUser "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/user"
 	domainWebhook "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/webhook"
+	campaigninfra "github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/campaign"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatstorage"
 	chatwootinfra "github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 	webhookinfra "github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/webhook"
@@ -55,6 +57,11 @@ var (
 	// Per-device webhook config (shares the chatStorageDB connection)
 	webhookConfigRepo domainWebhook.IDeviceWebhookRepository
 	webhookRegistry   *webhookinfra.WebhookRegistry
+
+	// Mass-messaging campaigns (shares the chatStorageDB connection)
+	campaignRepo         domainCampaign.ICampaignRepository
+	campaignTemplateRepo domainCampaign.ITemplateRepository
+	campaignManager      *campaigninfra.Manager
 
 	// Usecase
 	appUsecase        domainApp.IAppUsecase
@@ -466,6 +473,28 @@ func initWebhookConfig() {
 	webhookinfra.SetGlobalRegistry(webhookRegistry)
 }
 
+// initCampaign sets up campaign persistence and the runner manager. It shares the
+// chatStorageDB connection and delivers through the send usecase, so it must run
+// after the usecases are constructed.
+func initCampaign() {
+	campaignRepo = campaigninfra.NewSQLiteRepository(chatStorageDB)
+	if err := campaignRepo.Migrate(); err != nil {
+		logrus.Errorf("Campaign: failed to migrate tables: %v", err)
+		campaignRepo = nil
+		return
+	}
+	campaignTemplateRepo = campaigninfra.NewTemplateRepository(chatStorageDB)
+	if err := campaignTemplateRepo.Migrate(); err != nil {
+		logrus.Errorf("Campaign: failed to migrate templates table: %v", err)
+		campaignRepo = nil
+		campaignTemplateRepo = nil
+		return
+	}
+	sender := campaigninfra.NewWhatsAppSender(whatsapp.GetDeviceManager(), sendUsecase)
+	campaignManager = campaigninfra.NewManager(campaignRepo, sender)
+	campaigninfra.SetGlobalManager(campaignManager)
+}
+
 func initApp() {
 	if config.AppDebug {
 		config.WhatsappLogLevel = "DEBUG"
@@ -519,6 +548,10 @@ func initApp() {
 	groupUsecase = usecase.NewGroupService()
 	newsletterUsecase = usecase.NewNewsletterService()
 	deviceUsecase = usecase.NewDeviceService(dm)
+
+	// Campaign module persistence + runner manager (uses sendUsecase, so it must
+	// be initialized after the usecases above).
+	initCampaign()
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

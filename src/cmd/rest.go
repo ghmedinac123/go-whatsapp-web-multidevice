@@ -159,6 +159,14 @@ func restServer(_ *cobra.Command, _ []string) {
 		apiGroup.Delete("/webhook/configs/:id", webhookConfigHandler.Delete)
 	}
 
+	// Campaign (mass messaging) CRUD + lifecycle. Admin/config routes (not
+	// device-scoped); sending happens internally through the configured devices,
+	// so they are registered BEFORE DeviceMiddleware like the other config routes.
+	if campaignRepo != nil {
+		campaignHandler := rest.NewCampaignHandler(campaignRepo, campaignTemplateRepo, campaignManager)
+		rest.RegisterCampaignRoutes(apiGroup, campaignHandler)
+	}
+
 	// Device-scoped operations (header-based)
 	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
 	registerDeviceScopedRoutes(headerDeviceGroup)
@@ -172,10 +180,10 @@ func restServer(_ *cobra.Command, _ []string) {
 
 	apiGroup.Get("/", func(c *fiber.Ctx) error {
 		return c.Render("views/index", fiber.Map{
-			"AppHost":        fmt.Sprintf("%s://%s", c.Protocol(), c.Hostname()),
-			"AppVersion":     config.AppVersion,
-			"AppBasePath":    config.AppBasePath,
-			"BasicAuthToken": c.UserContext().Value(middleware.AuthorizationValue("BASIC_AUTH")),
+			"AppHost":         fmt.Sprintf("%s://%s", c.Protocol(), c.Hostname()),
+			"AppVersion":      config.AppVersion,
+			"AppBasePath":     config.AppBasePath,
+			"BasicAuthToken":  c.UserContext().Value(middleware.AuthorizationValue("BASIC_AUTH")),
 			"MaxFileSize":     humanize.Bytes(uint64(config.WhatsappSettingMaxFileSize)),
 			"MaxVideoSize":    humanize.Bytes(uint64(config.WhatsappSettingMaxVideoSize)),
 			"ChatwootEnabled": config.ChatwootEnabled,
