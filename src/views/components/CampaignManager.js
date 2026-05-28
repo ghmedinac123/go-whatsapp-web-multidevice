@@ -9,12 +9,27 @@ export default {
             saving: false,
             editing: false,
             form: this.emptyForm(),
+            // tag discovery for the template editor
+            analyzeResult: null,
+            availableTags: [],
             // detail of the currently opened campaign
             selected: null,
             recipients: [],
             senderForm: {device_id: '', max_daily: 200},
+            batchSize: 0,
+            // recipient import (detail view)
+            importMode: 'paste',
             importForm: {format: 'json', text: ''},
             importPreview: null,
+            importFile: null,
+            fileAnalysis: null,
+            selectedPhoneColumn: '',
+            savingTemplate: false,
+            // contacts picker
+            contacts: [],
+            contactsLoading: false,
+            contactSearch: '',
+            selectedContacts: {},
             templateForm: {name: '', body: '', category: ''},
             preview: '',
             pollTimer: null,
@@ -26,7 +41,34 @@ export default {
         deviceOptions() {
             if (!this.connected || this.connected.length === 0) return [];
             return this.connected.map(d => d.jid || d.device || d.id).filter(Boolean);
-        }
+        },
+        // Tags shown in the template editor: always {nombre}, plus any from the
+        // campaign's recipients and the most recent file analysis.
+        editorTags() {
+            const set = new Set(['{nombre}']);
+            (this.availableTags || []).forEach(t => set.add(t));
+            if (this.analyzeResult) (this.analyzeResult.tags || []).forEach(t => set.add(t));
+            return [...set];
+        },
+        filteredContacts() {
+            const q = this.contactSearch.trim().toLowerCase();
+            if (!q) return this.contacts;
+            return this.contacts.filter(c =>
+                (c.name || '').toLowerCase().includes(q) || this.jidToPhone(c.jid).includes(q));
+        },
+        selectedContactCount() {
+            return Object.values(this.selectedContacts).filter(Boolean).length;
+        },
+        // Tags usable in the detail-view inline template editor, by import mode.
+        detailTags() {
+            if (this.importMode === 'contacts') return ['{nombre}', '{phone}'];
+            if (this.importMode === 'file' && this.fileAnalysis) {
+                return (this.fileAnalysis.columns || [])
+                    .filter(c => c && c !== this.selectedPhoneColumn)
+                    .map(c => '{' + c + '}');
+            }
+            return [];
+        },
     },
     methods: {
         emptyForm() {
@@ -48,6 +90,8 @@ export default {
             this.editing = false;
             this.form = this.emptyForm();
             this.preview = '';
+            this.analyzeResult = null;
+            this.availableTags = [];
         },
         async fetchCampaigns() {
             this.loading = true;
@@ -69,14 +113,21 @@ export default {
             }[status] || 'grey';
         },
         // --- campaign form ---
-        editCampaign(c) {
+        async editCampaign(c) {
             this.editing = true;
             this.form = {
                 id: c.id, name: c.name,
                 template_body: c.template_body,
                 template_media: c.template_media || '',
             };
+            this.analyzeResult = null;
             this.refreshPreview();
+            try {
+                const res = await window.http.get(`/campaigns/${c.id}/variables`);
+                this.availableTags = (res.data.results && res.data.results.tags) || [];
+            } catch (_) {
+                this.availableTags = [];
+            }
         },
         async saveCampaign() {
             if (!this.form.name.trim()) return showErrorInfo('Name is required');
@@ -114,6 +165,28 @@ export default {
                 showErrorInfo(this.errMsg(err));
             }
         },
+        // insert a {tag} into the template body at the end (with a separating space)
+        insertTag(tag) {
+            const body = this.form.template_body || '';
+            this.form.template_body = body + (body && !body.endsWith(' ') ? ' ' : '') + tag;
+            this.refreshPreview();
+        },
+        // analyze a CSV/Excel file just to discover its columns -> tags (no insert)
+        async analyzeEditorFile(e) {
+            const file = e.target.files && e.target.files[0];
+            if (!file) return;
+            try {
+                const fd = new FormData();
+                fd.append('file', file);
+                const res = await window.http.post(`/campaigns/import/analyze`, fd);
+                this.analyzeResult = res.data.results;
+                showSuccessInfo(`Columnas: ${(this.analyzeResult.columns || []).join(', ')}`);
+            } catch (err) {
+                showErrorInfo(this.errMsg(err));
+            } finally {
+                e.target.value = '';
+            }
+        },
         // --- lifecycle ---
         async action(c, verb) {
             try {
@@ -144,6 +217,9 @@ export default {
             this.selected = null;
             this.recipients = [];
             this.importPreview = null;
+            this.importFile = null;
+            this.contacts = [];
+            this.selectedContacts = {};
         },
         async fetchRecipients(id) {
             const res = await window.http.get(`/campaigns/${id}/recipients?limit=100`);
@@ -197,7 +273,7 @@ export default {
                 showErrorInfo(this.errMsg(err));
             }
         },
-        // --- recipient import ---
+        // --- recipient import: paste ---
         previewImport() {
             this.importPreview = null;
             const text = (this.importForm.text || '').trim();
@@ -216,7 +292,16 @@ export default {
                 showErrorInfo('Preview failed: ' + this.errMsg(err));
             }
         },
-        async importRecipients() {
+        // buildRecipientsURL composes the import URL with batch_size + extra params.
+        buildRecipientsURL(id, params) {
+            const sp = new URLSearchParams();
+            const bs = Number(this.batchSize) || 0;
+            if (bs > 0) sp.set('batch_size', bs);
+            Object.entries(params || {}).forEach(([k, v]) => { if (v) sp.set(k, v); });
+            const qs = sp.toString();
+            return `/campaigns/${id}/recipients${qs ? ('?' + qs) : ''}`;
+        },
+        async importPaste() {
             const id = this.selected.campaign.id;
             const text = (this.importForm.text || '').trim();
             if (!text) return showErrorInfo('Nothing to import');
@@ -224,20 +309,122 @@ export default {
                 let res;
                 if (this.importForm.format === 'json') {
                     const arr = JSON.parse(text);
-                    res = await window.http.post(`/campaigns/${id}/recipients`, arr);
+                    res = await window.http.post(this.buildRecipientsURL(id, {}), arr);
                 } else {
-                    res = await window.http.post(`/campaigns/${id}/recipients?format=csv`, text, {
+                    res = await window.http.post(this.buildRecipientsURL(id, {format: 'csv'}), text, {
                         headers: {'Content-Type': 'text/csv'},
                     });
                 }
-                const r = res.data.results || {};
-                showSuccessInfo(`Imported ${r.imported} (skipped ${r.skipped})`);
+                this.afterImport(res);
                 this.importForm.text = '';
                 this.importPreview = null;
-                await this.openDetail(id);
             } catch (err) {
                 showErrorInfo(this.errMsg(err));
             }
+        },
+        // --- recipient import: file (CSV/Excel) ---
+        // Selecting a file immediately analyzes it so the user can pick the phone column.
+        async onImportFile(e) {
+            this.importFile = (e.target.files && e.target.files[0]) || null;
+            this.fileAnalysis = null;
+            this.selectedPhoneColumn = '';
+            if (!this.importFile) return;
+            try {
+                const fd = new FormData();
+                fd.append('file', this.importFile);
+                const res = await window.http.post(`/campaigns/import/analyze`, fd);
+                this.fileAnalysis = res.data.results;
+                this.selectedPhoneColumn = this.fileAnalysis.phone_column ||
+                    (this.fileAnalysis.columns || [])[0] || '';
+            } catch (err) {
+                showErrorInfo('No se pudo analizar el archivo: ' + this.errMsg(err));
+            }
+        },
+        async importFromFile() {
+            if (!this.importFile) return showErrorInfo('Selecciona un archivo CSV/Excel');
+            if (!this.selectedPhoneColumn) return showErrorInfo('Selecciona la columna del teléfono');
+            const id = this.selected.campaign.id;
+            try {
+                const fd = new FormData();
+                fd.append('file', this.importFile);
+                const url = this.buildRecipientsURL(id, {phone_column: this.selectedPhoneColumn});
+                const res = await window.http.post(url, fd);
+                this.afterImport(res);
+                this.importFile = null;
+                this.fileAnalysis = null;
+                this.selectedPhoneColumn = '';
+            } catch (err) {
+                showErrorInfo(this.errMsg(err));
+            }
+        },
+        // insert a tag into the open campaign's template (detail view) + persist on save
+        insertTagDetail(tag) {
+            const body = this.selected.campaign.template_body || '';
+            this.selected.campaign.template_body = body + (body && !body.endsWith(' ') ? ' ' : '') + tag;
+        },
+        async saveDetailTemplate() {
+            this.savingTemplate = true;
+            try {
+                const c = this.selected.campaign;
+                await window.http.put(`/campaigns/${c.id}`, {
+                    name: c.name,
+                    template_body: c.template_body,
+                    template_media: c.template_media || '',
+                });
+                showSuccessInfo('Plantilla guardada');
+            } catch (err) {
+                showErrorInfo(this.errMsg(err));
+            } finally {
+                this.savingTemplate = false;
+            }
+        },
+        // --- recipient import: contacts ---
+        jidToPhone(jid) {
+            return (jid || '').split('@')[0].split(':')[0];
+        },
+        async fetchContacts() {
+            this.contactsLoading = true;
+            try {
+                const res = await window.http.get(`/user/my/contacts`);
+                const results = res.data.results || {};
+                const list = results.data || [];
+                // keep only entries with a usable phone JID
+                this.contacts = list.filter(c => this.jidToPhone(c.jid).length >= 8);
+            } catch (err) {
+                showErrorInfo('No se pudieron cargar contactos (¿device seleccionado?): ' + this.errMsg(err));
+            } finally {
+                this.contactsLoading = false;
+            }
+        },
+        toggleContact(jid) {
+            this.selectedContacts = {...this.selectedContacts, [jid]: !this.selectedContacts[jid]};
+        },
+        selectAllContacts() {
+            const next = {};
+            this.filteredContacts.forEach(c => { next[c.jid] = true; });
+            this.selectedContacts = next;
+        },
+        clearContactSelection() {
+            this.selectedContacts = {};
+        },
+        async importFromContacts() {
+            const id = this.selected.campaign.id;
+            const chosen = this.contacts
+                .filter(c => this.selectedContacts[c.jid])
+                .map(c => ({phone: this.jidToPhone(c.jid), name: c.name || ''}));
+            if (chosen.length === 0) return showErrorInfo('Selecciona al menos un contacto');
+            try {
+                const res = await window.http.post(this.buildRecipientsURL(id, {}), chosen);
+                this.afterImport(res);
+                this.selectedContacts = {};
+            } catch (err) {
+                showErrorInfo(this.errMsg(err));
+            }
+        },
+        afterImport(res) {
+            const r = (res && res.data && res.data.results) || {};
+            showSuccessInfo(`Importados ${r.imported} (omitidos ${r.skipped})`);
+            this.openDetail(this.selected.campaign.id);
         },
         // --- templates ---
         async saveTemplate() {
@@ -360,9 +547,7 @@ export default {
                 <div v-if="loading" class="ui active centered inline loader"></div>
                 <table v-else class="ui celled compact table">
                     <thead>
-                        <tr>
-                            <th>Name</th><th>Status</th><th>Template</th><th>Actions</th>
-                        </tr>
+                        <tr><th>Name</th><th>Status</th><th>Template</th><th>Actions</th></tr>
                     </thead>
                     <tbody>
                         <tr v-if="campaigns.length === 0">
@@ -405,6 +590,27 @@ export default {
                         <textarea rows="3" v-model="form.template_body" @input="refreshPreview"
                             placeholder="{Hola|Buenas} {nombre}, {tenemos|traemos} una {oferta|promo} para {empresa}"></textarea>
                     </div>
+
+                    <div class="field">
+                        <label>Tags disponibles (clic para insertar)</label>
+                        <div>
+                            <a v-for="tag in editorTags" :key="tag" class="ui small teal label" style="cursor:pointer; margin-bottom:4px" @click="insertTag(tag)">{{ tag }}</a>
+                        </div>
+                        <div style="margin-top:6px">
+                            <label class="ui small button" style="cursor:pointer">
+                                <i class="upload icon"></i> Analizar CSV/Excel para detectar columnas
+                                <input type="file" accept=".csv,.xlsx,.json" hidden @change="analyzeEditorFile">
+                            </label>
+                        </div>
+                        <div v-if="analyzeResult" class="ui small message">
+                            <strong>Columnas detectadas:</strong> {{ (analyzeResult.columns || []).join(', ') }}
+                            <span v-if="analyzeResult.phone_column"> · teléfono: <code>{{ analyzeResult.phone_column }}</code></span>
+                            <div v-if="(analyzeResult.sample_rows||[]).length" style="margin-top:4px; font-size:0.85em; color:#666">
+                                Ejemplo: {{ JSON.stringify(analyzeResult.sample_rows[0]) }}
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="field" v-if="preview">
                         <label>Live preview</label>
                         <div class="ui message" style="white-space:pre-wrap">{{ preview }}</div>
@@ -508,30 +714,117 @@ export default {
 
                 <!-- recipient import -->
                 <div class="ui horizontal divider">Import recipients</div>
-                <form class="ui form">
+                <div class="ui secondary menu">
+                    <a class="item" :class="{active: importMode==='paste'}" @click="importMode='paste'">Pegar</a>
+                    <a class="item" :class="{active: importMode==='file'}" @click="importMode='file'">Archivo (CSV/Excel)</a>
+                    <a class="item" :class="{active: importMode==='contacts'}" @click="importMode='contacts'; contacts.length || fetchContacts()">Contactos</a>
+                </div>
+
+                <div class="ui form" style="margin-bottom:10px">
+                    <div class="inline field">
+                        <label>Tamaño de lote (N)</label>
+                        <input type="number" v-model="batchSize" min="0" style="width:120px" placeholder="0 = sin lotes">
+                        <span style="color:#888; margin-left:8px">0 = un solo lote; N = tandas de N</span>
+                    </div>
+                </div>
+
+                <!-- paste mode -->
+                <form v-if="importMode==='paste'" class="ui form">
                     <div class="inline fields">
-                        <label>Format</label>
+                        <label>Formato</label>
                         <div class="field"><div class="ui radio checkbox"><input type="radio" value="json" v-model="importForm.format"><label>JSON</label></div></div>
                         <div class="field"><div class="ui radio checkbox"><input type="radio" value="csv" v-model="importForm.format"><label>CSV</label></div></div>
                     </div>
                     <div class="field">
-                        <textarea rows="4" v-model="importForm.text"
-                            :placeholder="importForm.format === 'json' ? jsonPlaceholder : csvPlaceholder"></textarea>
+                        <textarea rows="4" v-model="importForm.text" :placeholder="importForm.format === 'json' ? jsonPlaceholder : csvPlaceholder"></textarea>
                     </div>
                     <button class="ui button" type="button" @click="previewImport">Preview</button>
-                    <button class="ui green button" type="button" @click="importRecipients">Import</button>
+                    <button class="ui green button" type="button" @click="importPaste">Import</button>
                     <div v-if="importPreview" class="ui small message">
                         <div v-for="(row, idx) in importPreview" :key="idx">{{ JSON.stringify(row) }}</div>
                     </div>
                 </form>
 
+                <!-- file mode -->
+                <form v-else-if="importMode==='file'" class="ui form">
+                    <div class="field">
+                        <label>Archivo CSV o Excel (.xlsx)</label>
+                        <input type="file" accept=".csv,.xlsx,.json" @change="onImportFile">
+                    </div>
+                    <div v-if="fileAnalysis">
+                        <div class="two fields">
+                            <div class="field">
+                                <label>Columna del teléfono (obligatorio)</label>
+                                <select v-model="selectedPhoneColumn">
+                                    <option value="">(selecciona la columna)</option>
+                                    <option v-for="col in fileAnalysis.columns" :key="col" :value="col">{{ col }}</option>
+                                </select>
+                            </div>
+                            <div class="field">
+                                <label>Filas detectadas</label>
+                                <input type="text" :value="fileAnalysis.row_count + ' filas'" disabled>
+                            </div>
+                        </div>
+                        <div v-if="(fileAnalysis.sample_rows||[]).length" class="ui small message" style="font-size:0.85em">
+                            Ejemplo: {{ JSON.stringify(fileAnalysis.sample_rows[0]) }}
+                        </div>
+                    </div>
+                    <button class="ui green button" type="button" @click="importFromFile" :disabled="!selectedPhoneColumn">Importar archivo</button>
+                    <span v-if="importFile" style="margin-left:8px; color:#666">{{ importFile.name }}</span>
+                </form>
+
+                <!-- contacts mode -->
+                <div v-else>
+                    <div class="ui action input" style="margin-bottom:8px; width:100%">
+                        <input type="text" v-model="contactSearch" placeholder="Buscar contacto por nombre o número...">
+                        <button class="ui button" @click="selectAllContacts">Seleccionar visibles</button>
+                        <button class="ui button" @click="clearContactSelection">Limpiar</button>
+                    </div>
+                    <div v-if="contactsLoading" class="ui active centered inline loader"></div>
+                    <div v-else style="max-height:220px; overflow-y:auto; border:1px solid #eee; border-radius:4px">
+                        <table class="ui very compact small table" style="margin:0">
+                            <tbody>
+                                <tr v-if="filteredContacts.length === 0"><td style="text-align:center; color:#888">Sin contactos (selecciona un device y reintenta)</td></tr>
+                                <tr v-for="ct in filteredContacts" :key="ct.jid" @click="toggleContact(ct.jid)" style="cursor:pointer">
+                                    <td style="width:36px">
+                                        <div class="ui checkbox"><input type="checkbox" :checked="!!selectedContacts[ct.jid]"></div>
+                                    </td>
+                                    <td>{{ ct.name || '(sin nombre)' }}</td>
+                                    <td style="color:#888">{{ jidToPhone(ct.jid) }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div style="margin-top:8px">
+                        <button class="ui green button" @click="importFromContacts">Importar {{ selectedContactCount }} seleccionados</button>
+                        <button class="ui button" @click="fetchContacts">Recargar contactos</button>
+                    </div>
+                </div>
+
+                <!-- inline template editor: write the message using the tags from this source -->
+                <div v-if="importMode !== 'paste' && detailTags.length" class="ui segment" style="margin-top:12px">
+                    <div class="ui small header">Plantilla del mensaje</div>
+                    <div style="margin-bottom:6px">
+                        Tags disponibles:
+                        <a v-for="tag in detailTags" :key="tag" class="ui small teal label" style="cursor:pointer" @click="insertTagDetail(tag)">{{ tag }}</a>
+                    </div>
+                    <div class="ui form">
+                        <div class="field">
+                            <textarea rows="3" v-model="selected.campaign.template_body"
+                                placeholder="{Hola|Buenas} {nombre}, ..."></textarea>
+                        </div>
+                        <button class="ui purple button" type="button" :class="{loading: savingTemplate}" @click="saveDetailTemplate">Guardar plantilla</button>
+                    </div>
+                </div>
+
                 <!-- recipient list -->
                 <div class="ui horizontal divider">Recipients (first 100)</div>
                 <table class="ui celled compact small table">
-                    <thead><tr><th>Phone</th><th>Name</th><th>Status</th><th>Sent by</th><th>Error</th></tr></thead>
+                    <thead><tr><th>Lote</th><th>Phone</th><th>Name</th><th>Status</th><th>Sent by</th><th>Error</th></tr></thead>
                     <tbody>
-                        <tr v-if="recipients.length === 0"><td colspan="5" style="text-align:center">No recipients yet.</td></tr>
+                        <tr v-if="recipients.length === 0"><td colspan="6" style="text-align:center">No recipients yet.</td></tr>
                         <tr v-for="r in recipients" :key="r.id">
+                            <td>{{ r.batch }}</td>
                             <td>{{ r.phone }}</td>
                             <td>{{ r.name }}</td>
                             <td><span :class="['ui tiny label', statusColor(r.status === 'sent' ? 'running' : (r.status === 'failed' ? 'cancelled' : 'grey'))]">{{ r.status }}</span></td>

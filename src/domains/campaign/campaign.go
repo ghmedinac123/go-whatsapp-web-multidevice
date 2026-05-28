@@ -59,6 +59,7 @@ type Recipient struct {
 	Phone        string            `json:"phone"`
 	Name         string            `json:"name"`
 	Variables    map[string]string `json:"variables"`
+	Batch        int               `json:"batch"`
 	Status       string            `json:"status"`
 	SentByDevice string            `json:"sent_by_device"`
 	SentAt       *time.Time        `json:"sent_at"`

@@ -88,7 +88,7 @@ func TestRecipientDedupAndStatus(t *testing.T) {
 		{Phone: "573001112233", Name: "Ana"},
 		{Phone: "573166203787", Name: "dup"}, // duplicate phone -> ignored
 	}
-	added, err := repo.AddRecipients(c.ID, recipients)
+	added, err := repo.AddRecipients(c.ID, recipients, 0)
 	if err != nil {
 		t.Fatalf("add recipients: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestRecipientDedupAndStatus(t *testing.T) {
 	}
 
 	// Adding the same phones again inserts nothing.
-	added, err = repo.AddRecipients(c.ID, recipients)
+	added, err = repo.AddRecipients(c.ID, recipients, 0)
 	if err != nil {
 		t.Fatalf("add recipients (2nd): %v", err)
 	}
@@ -129,6 +129,67 @@ func TestRecipientDedupAndStatus(t *testing.T) {
 	next2, _ := repo.NextPendingRecipient(c.ID)
 	if next2 == nil || next2.ID == next.ID {
 		t.Fatalf("expected a different pending recipient, got %+v", next2)
+	}
+}
+
+func TestRecipientBatching(t *testing.T) {
+	repo := newTestRepo(t)
+	c := &domainCampaign.Campaign{Name: "C", TemplateBody: "hi"}
+	if err := repo.CreateCampaign(c); err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+
+	recipients := []*domainCampaign.Recipient{
+		{Phone: "57300000001"}, {Phone: "57300000002"}, {Phone: "57300000003"},
+		{Phone: "57300000004"}, {Phone: "57300000005"},
+	}
+	if _, err := repo.AddRecipients(c.ID, recipients, 2); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	list, _ := repo.ListRecipients(c.ID, "", 0)
+	wantBatches := []int{1, 1, 2, 2, 3}
+	if len(list) != 5 {
+		t.Fatalf("expected 5 recipients, got %d", len(list))
+	}
+	for i, rec := range list {
+		if rec.Batch != wantBatches[i] {
+			t.Fatalf("recipient %d batch = %d, want %d (all: %+v)", i, rec.Batch, wantBatches[i], list)
+		}
+	}
+
+	// A second import continues lote numbering after the existing max (3).
+	if _, err := repo.AddRecipients(c.ID, []*domainCampaign.Recipient{{Phone: "57300000099"}}, 2); err != nil {
+		t.Fatalf("add 2nd: %v", err)
+	}
+	list, _ = repo.ListRecipients(c.ID, "", 0)
+	last := list[len(list)-1]
+	if last.Batch != 4 {
+		t.Fatalf("expected continued batch 4, got %d", last.Batch)
+	}
+}
+
+func TestVariableKeys(t *testing.T) {
+	repo := newTestRepo(t)
+	c := &domainCampaign.Campaign{Name: "C", TemplateBody: "hi"}
+	_ = repo.CreateCampaign(c)
+	_, _ = repo.AddRecipients(c.ID, []*domainCampaign.Recipient{
+		{Phone: "57300000001", Variables: map[string]string{"empresa": "F"}},
+		{Phone: "57300000002", Variables: map[string]string{"ciudad": "Bogotá"}},
+	}, 0)
+
+	keys, err := repo.VariableKeys(c.ID, 0)
+	if err != nil {
+		t.Fatalf("variable keys: %v", err)
+	}
+	want := []string{"ciudad", "empresa", "nombre", "phone"}
+	if len(keys) != len(want) {
+		t.Fatalf("expected %v, got %v", want, keys)
+	}
+	for i := range want {
+		if keys[i] != want[i] {
+			t.Fatalf("keys = %v, want %v", keys, want)
+		}
 	}
 }
 

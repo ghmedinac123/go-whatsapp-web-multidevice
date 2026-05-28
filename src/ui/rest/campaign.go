@@ -36,6 +36,9 @@ func NewCampaignHandler(
 // are admin/config routes (not device-scoped), so they are registered before the
 // device middleware.
 func RegisterCampaignRoutes(router fiber.Router, h *CampaignHandler) {
+	// Static segment route registered before "/campaigns/:id" so it is unambiguous.
+	router.Post("/campaigns/import/analyze", h.AnalyzeImport)
+
 	router.Get("/campaigns", h.List)
 	router.Post("/campaigns", h.Create)
 	router.Get("/campaigns/:id", h.Get)
@@ -49,6 +52,7 @@ func RegisterCampaignRoutes(router fiber.Router, h *CampaignHandler) {
 
 	router.Get("/campaigns/:id/recipients", h.ListRecipients)
 	router.Post("/campaigns/:id/recipients", h.ImportRecipients)
+	router.Get("/campaigns/:id/variables", h.Variables)
 	router.Get("/campaigns/:id/stats", h.Stats)
 
 	router.Get("/campaigns/:id/senders", h.ListSenders)
@@ -252,18 +256,23 @@ func (h *CampaignHandler) ImportRecipients(c *fiber.Ctx) error {
 		return notFound(c, "Campaign not found")
 	}
 
-	data, isCSV, err := readImportPayload(c)
+	data, format, err := readImportPayload(c)
 	if err != nil {
 		return utils.ResponseError(c, err.Error())
 	}
-	recipients, err := campaigninfra.ParseRecipients(data, isCSV)
+	opts := campaigninfra.ImportOptions{
+		PhoneColumn: strings.TrimSpace(c.Query("phone_column")),
+		NameColumn:  strings.TrimSpace(c.Query("name_column")),
+	}
+	recipients, err := campaigninfra.ParseRecipients(data, format, opts)
 	if err != nil {
 		return utils.ResponseError(c, err.Error())
 	}
 	if len(recipients) == 0 {
 		return utils.ResponseError(c, "No valid recipients found in payload")
 	}
-	added, err := h.Repo.AddRecipients(id, recipients)
+	batchSize, _ := strconv.Atoi(c.Query("batch_size"))
+	added, err := h.Repo.AddRecipients(id, recipients, batchSize)
 	if err != nil {
 		return h.internalError(c, err)
 	}
@@ -272,6 +281,38 @@ func (h *CampaignHandler) ImportRecipients(c *fiber.Ctx) error {
 		"imported": added,
 		"skipped":  len(recipients) - added,
 	})
+}
+
+// AnalyzeImport inspects an uploaded payload (file or body) and returns its
+// columns and usable {tags} without inserting anything.
+func (h *CampaignHandler) AnalyzeImport(c *fiber.Ctx) error {
+	data, format, err := readImportPayload(c)
+	if err != nil {
+		return utils.ResponseError(c, err.Error())
+	}
+	analysis, err := campaigninfra.AnalyzeImport(data, format)
+	if err != nil {
+		return utils.ResponseError(c, err.Error())
+	}
+	return ok(c, "Import analysis", analysis)
+}
+
+// Variables returns the {tags} usable in a campaign's template, derived from the
+// variable keys of its imported recipients plus the always-available nombre/phone.
+func (h *CampaignHandler) Variables(c *fiber.Ctx) error {
+	id, err := idParam(c, "id")
+	if err != nil {
+		return utils.ResponseError(c, err.Error())
+	}
+	keys, err := h.Repo.VariableKeys(id, 1000)
+	if err != nil {
+		return h.internalError(c, err)
+	}
+	tags := make([]string, len(keys))
+	for i, k := range keys {
+		tags[i] = "{" + k + "}"
+	}
+	return ok(c, "Variables", fiber.Map{"keys": keys, "tags": tags})
 }
 
 func (h *CampaignHandler) Stats(c *fiber.Ctx) error {
@@ -427,30 +468,61 @@ func parseSchedule(s *string) (*time.Time, error) {
 	return &t, nil
 }
 
-// readImportPayload extracts the recipient payload bytes and whether it is CSV,
-// from either a multipart file upload or the raw request body.
-func readImportPayload(c *fiber.Ctx) ([]byte, bool, error) {
+// readImportPayload extracts the recipient payload bytes and its format
+// ("csv"/"xlsx"/"json"), from either a multipart file upload or the raw body.
+func readImportPayload(c *fiber.Ctx) ([]byte, string, error) {
 	if fh, err := c.FormFile("file"); err == nil && fh != nil {
 		f, err := fh.Open()
 		if err != nil {
-			return nil, false, errors.New("cannot open uploaded file")
+			return nil, "", errors.New("cannot open uploaded file")
 		}
 		defer f.Close()
 		buf, err := io.ReadAll(f)
 		if err != nil {
-			return nil, false, errors.New("cannot read uploaded file")
+			return nil, "", errors.New("cannot read uploaded file")
 		}
-		isCSV := strings.HasSuffix(strings.ToLower(fh.Filename), ".csv")
-		return buf, isCSV, nil
+		return buf, formatFromFilename(fh.Filename), nil
 	}
 
 	body := c.Body()
 	if len(body) == 0 {
-		return nil, false, errors.New("empty request body")
+		return nil, "", errors.New("empty request body")
 	}
-	isCSV := strings.EqualFold(c.Query("format"), "csv") ||
-		strings.Contains(strings.ToLower(c.Get("Content-Type")), "csv")
-	return body, isCSV, nil
+	return body, formatFromRequest(c), nil
+}
+
+// formatFromFilename maps a file extension to an import format, defaulting to CSV.
+func formatFromFilename(name string) string {
+	switch {
+	case strings.HasSuffix(strings.ToLower(name), ".xlsx"):
+		return campaigninfra.FormatXLSX
+	case strings.HasSuffix(strings.ToLower(name), ".json"):
+		return campaigninfra.FormatJSON
+	default:
+		return campaigninfra.FormatCSV
+	}
+}
+
+// formatFromRequest reads the ?format query or Content-Type for a raw body,
+// defaulting to JSON (the shape the UI posts).
+func formatFromRequest(c *fiber.Ctx) string {
+	switch strings.ToLower(strings.TrimSpace(c.Query("format"))) {
+	case campaigninfra.FormatCSV:
+		return campaigninfra.FormatCSV
+	case campaigninfra.FormatXLSX:
+		return campaigninfra.FormatXLSX
+	case campaigninfra.FormatJSON:
+		return campaigninfra.FormatJSON
+	}
+	ct := strings.ToLower(c.Get("Content-Type"))
+	switch {
+	case strings.Contains(ct, "csv"):
+		return campaigninfra.FormatCSV
+	case strings.Contains(ct, "spreadsheet") || strings.Contains(ct, "xlsx"):
+		return campaigninfra.FormatXLSX
+	default:
+		return campaigninfra.FormatJSON
+	}
 }
 
 func nonNilSenders(senders []*domainCampaign.Sender) []*domainCampaign.Sender {

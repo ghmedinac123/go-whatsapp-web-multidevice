@@ -35,11 +35,16 @@ type ICampaignRepository interface {
 
 	// --- Recipients ---
 	// AddRecipients bulk-inserts recipients, ignoring duplicates by (campaign_id, phone).
+	// When batchSize > 0 the inserted rows are split into lotes of that size
+	// (continuing after any existing lote); otherwise they form a single new lote.
 	// It returns the number of rows actually inserted.
-	AddRecipients(campaignID int, recipients []*Recipient) (int, error)
+	AddRecipients(campaignID int, recipients []*Recipient, batchSize int) (int, error)
 	// ListRecipients returns recipients for a campaign. An empty status means "any";
 	// a non-positive limit means "no limit".
 	ListRecipients(campaignID int, status string, limit int) ([]*Recipient, error)
+	// VariableKeys returns the distinct variable keys used across a campaign's
+	// recipients (scanning up to limit rows), so the UI can show usable {tags}.
+	VariableKeys(campaignID int, limit int) ([]string, error)
 	// NextPendingRecipient returns the oldest pending recipient, or (nil, nil) when none remain.
 	NextPendingRecipient(campaignID int) (*Recipient, error)
 	// MarkRecipientSent flags a recipient as sent by a device, stamping sent_at.

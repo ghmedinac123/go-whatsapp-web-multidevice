@@ -75,7 +75,7 @@ func seedCampaign(t *testing.T, repo *SQLiteRepository, devices []string, phones
 	for i, p := range phones {
 		recipients[i] = &domainCampaign.Recipient{Phone: p, Name: "Name" + p}
 	}
-	if _, err := repo.AddRecipients(c.ID, recipients); err != nil {
+	if _, err := repo.AddRecipients(c.ID, recipients, 0); err != nil {
 		t.Fatalf("add recipients: %v", err)
 	}
 	return c.ID

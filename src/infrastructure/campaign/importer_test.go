@@ -1,6 +1,31 @@
 package campaign
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+
+	"github.com/xuri/excelize/v2"
+)
+
+// buildXLSX writes a single-sheet workbook from a header + rows into bytes.
+func buildXLSX(t *testing.T, header []string, rows [][]string) []byte {
+	t.Helper()
+	f := excelize.NewFile()
+	defer f.Close()
+	sheet := f.GetSheetName(0)
+	all := append([][]string{header}, rows...)
+	for r, row := range all {
+		for c, val := range row {
+			cell, _ := excelize.CoordinatesToCellName(c+1, r+1)
+			_ = f.SetCellValue(sheet, cell, val)
+		}
+	}
+	var buf bytes.Buffer
+	if err := f.Write(&buf); err != nil {
+		t.Fatalf("write xlsx: %v", err)
+	}
+	return buf.Bytes()
+}
 
 func TestNormalizePhone(t *testing.T) {
 	cases := []struct {
@@ -96,5 +121,124 @@ func TestParseJSON(t *testing.T) {
 func TestParseJSONInvalid(t *testing.T) {
 	if _, err := ParseJSON([]byte(`{"not":"an array"}`)); err == nil {
 		t.Fatal("expected error for non-array JSON")
+	}
+}
+
+func TestParseXLSX(t *testing.T) {
+	data := buildXLSX(t,
+		[]string{"phone", "name", "empresa"},
+		[][]string{
+			{"+57 316 6203787", "Gerlén", "Fututel"},
+			{"573001112233", "Ana", ""},
+			{"573166203787", "dup", "Other"}, // duplicate phone -> ignored
+			{"abc", "Invalid", "X"},          // invalid phone -> skipped
+		},
+	)
+	recs, err := ParseXLSX(data)
+	if err != nil {
+		t.Fatalf("parse xlsx: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("expected 2 recipients, got %d: %+v", len(recs), recs)
+	}
+	if recs[0].Phone != "573166203787" || recs[0].Name != "Gerlén" || recs[0].Variables["empresa"] != "Fututel" {
+		t.Fatalf("row0 mismatch: %+v", recs[0])
+	}
+}
+
+func TestParseRecipientsPhoneColumnOverride(t *testing.T) {
+	// "linea" is not a phone alias and "cliente" is not a name alias.
+	csv := "cliente,linea,empresa\nAna,573166203787,Fututel\n"
+
+	if _, err := ParseRecipients([]byte(csv), FormatCSV, ImportOptions{}); err == nil {
+		t.Fatal("expected error without an explicit phone column")
+	}
+
+	recs, err := ParseRecipients([]byte(csv), FormatCSV, ImportOptions{PhoneColumn: "linea", NameColumn: "cliente"})
+	if err != nil {
+		t.Fatalf("override parse: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Phone != "573166203787" || recs[0].Name != "Ana" {
+		t.Fatalf("override mismatch: %+v", recs)
+	}
+	if recs[0].Variables["empresa"] != "Fututel" {
+		t.Fatalf("expected empresa var, got %+v", recs[0].Variables)
+	}
+	if _, leaked := recs[0].Variables["linea"]; leaked {
+		t.Fatalf("phone column leaked into variables: %+v", recs[0].Variables)
+	}
+}
+
+func TestParseRecipientsJSONPhoneOverride(t *testing.T) {
+	body := `[{"cliente":"Ana","linea":"573166203787","empresa":"Fututel"}]`
+	recs, err := ParseRecipients([]byte(body), FormatJSON, ImportOptions{PhoneColumn: "linea", NameColumn: "cliente"})
+	if err != nil {
+		t.Fatalf("json override: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Phone != "573166203787" || recs[0].Name != "Ana" {
+		t.Fatalf("json override mismatch: %+v", recs)
+	}
+}
+
+func TestAnalyzeImportCSV(t *testing.T) {
+	csv := "phone,nombre,empresa,ciudad\n573166203787,Gerlén,Fututel,Bogotá\n"
+	a, err := AnalyzeImport([]byte(csv), FormatCSV)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if a.PhoneColumn != "phone" || a.NameColumn != "nombre" {
+		t.Fatalf("column detection wrong: %+v", a)
+	}
+	wantTags := map[string]bool{"{nombre}": true, "{empresa}": true, "{ciudad}": true}
+	if len(a.Tags) != 3 {
+		t.Fatalf("expected 3 tags, got %v", a.Tags)
+	}
+	for _, tag := range a.Tags {
+		if !wantTags[tag] {
+			t.Fatalf("unexpected tag %q in %v", tag, a.Tags)
+		}
+	}
+	if a.RowCount != 1 || len(a.SampleRows) != 1 || a.SampleRows[0]["empresa"] != "Fututel" {
+		t.Fatalf("sample/rowcount wrong: %+v", a)
+	}
+}
+
+func TestAnalyzeImportXLSX(t *testing.T) {
+	data := buildXLSX(t, []string{"phone", "name", "plan"}, [][]string{{"573166203787", "Ana", "Pro"}})
+	a, err := AnalyzeImport(data, FormatXLSX)
+	if err != nil {
+		t.Fatalf("analyze xlsx: %v", err)
+	}
+	if a.Format != FormatXLSX || a.PhoneColumn != "phone" {
+		t.Fatalf("xlsx analysis wrong: %+v", a)
+	}
+	found := false
+	for _, tag := range a.Tags {
+		if tag == "{plan}" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected {plan} tag, got %v", a.Tags)
+	}
+}
+
+func TestAnalyzeImportJSON(t *testing.T) {
+	body := `[{"phone":"573166203787","name":"Ana","empresa":"Fututel"}]`
+	a, err := AnalyzeImport([]byte(body), FormatJSON)
+	if err != nil {
+		t.Fatalf("analyze json: %v", err)
+	}
+	if a.PhoneColumn != "phone" || a.NameColumn != "name" {
+		t.Fatalf("json column detection wrong: %+v", a)
+	}
+	found := false
+	for _, tag := range a.Tags {
+		if tag == "{empresa}" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected {empresa} tag, got %v", a.Tags)
 	}
 }

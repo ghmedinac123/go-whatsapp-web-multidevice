@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -62,6 +63,7 @@ func (r *SQLiteRepository) Migrate() error {
 			read_at        DATETIME,
 			replied_at     DATETIME,
 			error_message  TEXT    NOT NULL DEFAULT '',
+			batch          INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(campaign_id, phone)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_campaign_recipients_campaign_status
@@ -71,6 +73,40 @@ func (r *SQLiteRepository) Migrate() error {
 		if _, err := r.db.Exec(stmt); err != nil {
 			return fmt.Errorf("campaign migrate: %w", err)
 		}
+	}
+	// Idempotent add for DBs created by an earlier build of this branch that
+	// predates the batch column.
+	if err := r.addColumnIfMissing("campaign_recipients", "batch", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// addColumnIfMissing adds a column when it is absent, so re-running Migrate on an
+// older DB is safe (SQLite has no "ADD COLUMN IF NOT EXISTS").
+func (r *SQLiteRepository) addColumnIfMissing(table, column, ddl string) error {
+	rows, err := r.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return fmt.Errorf("campaign migrate inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("campaign migrate scan %s: %w", table, err)
+		}
+		if name == column {
+			return nil // already present
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := r.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + ddl); err != nil {
+		return fmt.Errorf("campaign migrate add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -280,13 +316,20 @@ func (r *SQLiteRepository) ResetDailySent(campaignID int) error {
 
 // --- Recipients ---
 
-func (r *SQLiteRepository) AddRecipients(campaignID int, recipients []*domainCampaign.Recipient) (int, error) {
+func (r *SQLiteRepository) AddRecipients(campaignID int, recipients []*domainCampaign.Recipient, batchSize int) (int, error) {
 	if campaignID == 0 {
 		return 0, fmt.Errorf("campaign recipients: campaign_id is required")
 	}
 	if len(recipients) == 0 {
 		return 0, nil
 	}
+
+	// Continue lote numbering after any existing lote for this campaign.
+	var maxBatch int
+	if err := r.db.QueryRow(`SELECT COALESCE(MAX(batch), 0) FROM campaign_recipients WHERE campaign_id = ?`, campaignID).Scan(&maxBatch); err != nil {
+		return 0, fmt.Errorf("campaign recipients max batch: %w", err)
+	}
+
 	tx, err := r.db.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("campaign recipients begin: %w", err)
@@ -294,8 +337,8 @@ func (r *SQLiteRepository) AddRecipients(campaignID int, recipients []*domainCam
 	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.Prepare(`
-		INSERT OR IGNORE INTO campaign_recipients (campaign_id, phone, name, variables, status)
-		VALUES (?, ?, ?, ?, 'pending')
+		INSERT OR IGNORE INTO campaign_recipients (campaign_id, phone, name, variables, status, batch)
+		VALUES (?, ?, ?, ?, 'pending', ?)
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("campaign recipients prepare: %w", err)
@@ -303,7 +346,7 @@ func (r *SQLiteRepository) AddRecipients(campaignID int, recipients []*domainCam
 	defer stmt.Close()
 
 	added := 0
-	for _, rec := range recipients {
+	for i, rec := range recipients {
 		if rec == nil || strings.TrimSpace(rec.Phone) == "" {
 			continue
 		}
@@ -311,7 +354,11 @@ func (r *SQLiteRepository) AddRecipients(campaignID int, recipients []*domainCam
 		if err != nil {
 			return added, fmt.Errorf("campaign recipients encode: %w", err)
 		}
-		res, err := stmt.Exec(campaignID, rec.Phone, rec.Name, vars)
+		batch := maxBatch + 1
+		if batchSize > 0 {
+			batch = maxBatch + 1 + (i / batchSize)
+		}
+		res, err := stmt.Exec(campaignID, rec.Phone, rec.Name, vars, batch)
 		if err != nil {
 			return added, fmt.Errorf("campaign recipients insert: %w", err)
 		}
@@ -325,17 +372,53 @@ func (r *SQLiteRepository) AddRecipients(campaignID int, recipients []*domainCam
 	return added, nil
 }
 
+// VariableKeys scans up to `limit` recipients and returns the sorted distinct
+// variable keys plus the always-available nombre/phone tags.
+func (r *SQLiteRepository) VariableKeys(campaignID int, limit int) ([]string, error) {
+	query := `SELECT variables FROM campaign_recipients WHERE campaign_id = ? AND variables != ''`
+	args := []any{campaignID}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("campaign variable keys: %w", err)
+	}
+	defer rows.Close()
+
+	set := map[string]bool{"nombre": true, "phone": true}
+	for rows.Next() {
+		var vars string
+		if err := rows.Scan(&vars); err != nil {
+			return nil, fmt.Errorf("campaign variable keys scan: %w", err)
+		}
+		for k := range decodeVariables(vars) {
+			set[k] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
 func (r *SQLiteRepository) ListRecipients(campaignID int, status string, limit int) ([]*domainCampaign.Recipient, error) {
 	query := `
 		SELECT id, campaign_id, phone, name, variables, status, sent_by_device,
-		       sent_at, delivered_at, read_at, replied_at, error_message
+		       sent_at, delivered_at, read_at, replied_at, error_message, batch
 		FROM campaign_recipients WHERE campaign_id = ?`
 	args := []any{campaignID}
 	if strings.TrimSpace(status) != "" {
 		query += ` AND status = ?`
 		args = append(args, status)
 	}
-	query += ` ORDER BY id`
+	query += ` ORDER BY batch, id`
 	if limit > 0 {
 		query += ` LIMIT ?`
 		args = append(args, limit)
@@ -361,10 +444,10 @@ func (r *SQLiteRepository) ListRecipients(campaignID int, status string, limit i
 func (r *SQLiteRepository) NextPendingRecipient(campaignID int) (*domainCampaign.Recipient, error) {
 	row := r.db.QueryRow(`
 		SELECT id, campaign_id, phone, name, variables, status, sent_by_device,
-		       sent_at, delivered_at, read_at, replied_at, error_message
+		       sent_at, delivered_at, read_at, replied_at, error_message, batch
 		FROM campaign_recipients
 		WHERE campaign_id = ? AND status = 'pending'
-		ORDER BY id LIMIT 1
+		ORDER BY batch, id LIMIT 1
 	`, campaignID)
 
 	rec, err := scanRecipientRow(row)
@@ -437,7 +520,7 @@ func scanRecipientRow(s rowScanner) (*domainCampaign.Recipient, error) {
 	var sentAt, deliveredAt, readAt, repliedAt sql.NullString
 	err := s.Scan(
 		&rec.ID, &rec.CampaignID, &rec.Phone, &rec.Name, &vars, &rec.Status, &rec.SentByDevice,
-		&sentAt, &deliveredAt, &readAt, &repliedAt, &rec.ErrorMessage,
+		&sentAt, &deliveredAt, &readAt, &repliedAt, &rec.ErrorMessage, &rec.Batch,
 	)
 	if err != nil {
 		return nil, err
