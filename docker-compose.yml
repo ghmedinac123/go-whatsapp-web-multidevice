@@ -10,7 +10,7 @@ services:
       dockerfile: ./docker/golang.Dockerfile
     restart: unless-stopped
     ports:
-      - "3500:3000"
+      - "3500:3500"
     env_file:
       - src/.env
     volumes:
