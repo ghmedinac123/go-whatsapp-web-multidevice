@@ -8,9 +8,9 @@ services:
     build:
       context: .
       dockerfile: ./docker/golang.Dockerfile
-    restart: "on-failure"
+    restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "3500:3000"
     env_file:
       - src/.env
     volumes:
